@@ -1,95 +1,109 @@
 import json
 import boto3
+import pymysql
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 
 s3_client = boto3.client("s3")
+secrets_client = boto3.client("secretsmanager")
+
+SECRET_NAME = "weather-etl/rds-credentials"
+
+_db_creds = None
 
 
-def compute_comfort_category(temp_c, humidity):
-    """Simple heuristic comfort category based on temp + humidity."""
-    if temp_c >= 35:
-        return "hot"
-    elif temp_c >= 28 and humidity >= 60:
-        return "warm_humid"
-    elif temp_c >= 28:
-        return "warm"
-    elif temp_c <= 15:
-        return "cold"
-    else:
-        return "mild"
+def get_db_credentials():
+    global _db_creds
+    if _db_creds is None:
+        response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+        _db_creds = json.loads(response["SecretString"])
+    return _db_creds
 
 
-def flatten_reading(raw_entry, ingested_at):
-    """Flatten one city's OpenWeatherMap payload into a flat record."""
-    main = raw_entry.get("main", {})
-    wind = raw_entry.get("wind", {})
-    weather_list = raw_entry.get("weather", [{}])
-    weather_main = weather_list[0].get("main") if weather_list else None
-    weather_desc = weather_list[0].get("description") if weather_list else None
+def get_connection():
+    creds = get_db_credentials()
+    return pymysql.connect(
+        host=creds["host"],
+        user=creds["username"],
+        password=creds["password"],
+        database=creds["database"],
+        port=3306,
+        connect_timeout=10,
+        cursorclass=pymysql.cursors.Cursor,
+    )
 
-    temp_c = main.get("temp")
-    humidity = main.get("humidity")
 
-    return {
-        "city": raw_entry.get("name"),
-        "country": raw_entry.get("sys", {}).get("country"),
-        "reading_time_utc": datetime.fromtimestamp(
-            raw_entry.get("dt", 0), tz=timezone.utc
-        ).isoformat(),
-        "temp_celsius": temp_c,
-        "feels_like_celsius": main.get("feels_like"),
-        "humidity_pct": humidity,
-        "pressure_hpa": main.get("pressure"),
-        "weather_main": weather_main,
-        "weather_description": weather_desc,
-        "wind_speed_mps": wind.get("speed"),
-        "comfort_category": compute_comfort_category(temp_c, humidity)
-        if temp_c is not None and humidity is not None
-        else None,
-        "ingested_at": ingested_at,
-    }
+UPSERT_SQL = """
+INSERT INTO weather_readings (
+    city, country, reading_time_utc, temp_celsius, feels_like_celsius,
+    humidity_pct, pressure_hpa, weather_main, weather_description,
+    wind_speed_mps, comfort_category, ingested_at
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+)
+ON DUPLICATE KEY UPDATE
+    temp_celsius = VALUES(temp_celsius),
+    feels_like_celsius = VALUES(feels_like_celsius),
+    humidity_pct = VALUES(humidity_pct),
+    pressure_hpa = VALUES(pressure_hpa),
+    weather_main = VALUES(weather_main),
+    weather_description = VALUES(weather_description),
+    wind_speed_mps = VALUES(wind_speed_mps),
+    comfort_category = VALUES(comfort_category),
+    ingested_at = VALUES(ingested_at);
+"""
+
+
+def parse_datetime(value):
+    if value is None:
+        return None
+    return datetime.fromisoformat(value)
 
 
 def lambda_handler(event, context):
-    records_written = 0
+    rows_written = 0
+    connection = get_connection()
 
-    for s3_record in event.get("Records", []):
-        bucket = s3_record["s3"]["bucket"]["name"]
-        key = urllib.parse.unquote_plus(s3_record["s3"]["object"]["key"])
+    try:
+        with connection.cursor() as cursor:
+            for s3_record in event.get("Records", []):
+                bucket = s3_record["s3"]["bucket"]["name"]
+                key = urllib.parse.unquote_plus(s3_record["s3"]["object"]["key"])
 
-        print(f"Processing s3://{bucket}/{key}")
+                print(f"Processing s3://{bucket}/{key}")
 
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        raw_payload = json.loads(response["Body"].read().decode("utf-8"))
+                response = s3_client.get_object(Bucket=bucket, Key=key)
+                payload = json.loads(response["Body"].read().decode("utf-8"))
 
-        ingested_at = raw_payload.get("ingested_at")
-        raw_entries = raw_payload.get("data", [])
+                records = payload.get("records", [])
 
-        flattened = [flatten_reading(entry, ingested_at) for entry in raw_entries]
+                for record in records:
+                    cursor.execute(
+                        UPSERT_SQL,
+                        (
+                            record.get("city"),
+                            record.get("country"),
+                            parse_datetime(record.get("reading_time_utc")),
+                            record.get("temp_celsius"),
+                            record.get("feels_like_celsius"),
+                            record.get("humidity_pct"),
+                            record.get("pressure_hpa"),
+                            record.get("weather_main"),
+                            record.get("weather_description"),
+                            record.get("wind_speed_mps"),
+                            record.get("comfort_category"),
+                            parse_datetime(record.get("ingested_at")),
+                        ),
+                    )
+                    rows_written += 1
 
-        processed_key = key.replace("raw/", "processed/", 1).replace(
-            ".json", "-processed.json"
-        )
+        connection.commit()
+        print(f"Committed {rows_written} rows to weather_readings")
 
-        output_payload = {
-            "ingested_at": ingested_at,
-            "source_key": key,
-            "record_count": len(flattened),
-            "records": flattened,
-        }
-
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=processed_key,
-            Body=json.dumps(output_payload, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
-
-        print(f"Wrote {len(flattened)} records to s3://{bucket}/{processed_key}")
-        records_written += len(flattened)
+    finally:
+        connection.close()
 
     return {
         "statusCode": 200,
-        "body": f"Processed {records_written} records total",
+        "body": f"Upserted {rows_written} rows",
     }
